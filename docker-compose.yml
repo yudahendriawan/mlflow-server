@@ -1,0 +1,69 @@
+# Persistent local MLflow tracking server (PostgreSQL backend + proxied local artifacts).
+# All values come from .env (see .env.example). Nothing is exposed beyond 127.0.0.1.
+name: mlflow-server
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is not set (create .env from .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set (create .env from .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is not set (create .env from .env.example)}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No published ports: Postgres is only reachable from the MLflow container.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mlflow:
+    build:
+      context: .
+      args:
+        MLFLOW_VERSION: ${MLFLOW_VERSION:?MLFLOW_VERSION is not set (create .env from .env.example)}
+    image: mlflow-server:${MLFLOW_VERSION}
+    restart: unless-stopped
+    # Run an init process as PID 1 so uvicorn worker processes are reaped and
+    # signals are forwarded; without it the container can become unstoppable.
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Localhost only. Host port 5000 is avoided because macOS AirPlay Receiver uses it.
+      - "127.0.0.1:${MLFLOW_HOST_PORT:-5050}:5000"
+    volumes:
+      - mlartifacts:/mlartifacts
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --workers=2
+      # Explicit driver: SQLAlchemy 2.1 defaults "postgresql://" to psycopg 3, not psycopg2.
+      - --backend-store-uri=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - --serve-artifacts
+      - --artifacts-destination=/mlartifacts
+      - --default-artifact-root=mlflow-artifacts:/
+      # Host header allowlist (exact host:port match). /health is exempt by design.
+      - --allowed-hosts=localhost:${MLFLOW_HOST_PORT:-5050},127.0.0.1:${MLFLOW_HOST_PORT:-5050},host.docker.internal:${MLFLOW_HOST_PORT:-5050}
+      - --cors-allowed-origins=http://localhost:${MLFLOW_HOST_PORT:-5050},http://127.0.0.1:${MLFLOW_HOST_PORT:-5050},http://host.docker.internal:${MLFLOW_HOST_PORT:-5050}
+    healthcheck:
+      # The image has no curl/wget, so use Python's standard library.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health', timeout=5).status == 200 else 1)"
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  pgdata:
+  mlartifacts:
